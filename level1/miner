@@ -1,0 +1,217 @@
+#!/usr/bin/env python
+
+import hashlib
+import os
+import random
+import signal
+import sys
+import time
+
+import multiprocessing as mp
+
+import sh
+from sh import git
+from sh import kill
+
+LEDGER_PATH = 'LEDGER.txt'
+REPO_PATH = 'gitcoin-repo'
+
+# make sure we've got correct arguments
+if len(sys.argv) < 3:
+  print 'Usage: miner <clone_url> <public_username>'
+
+# store our argument values
+git_repo_url = sys.argv[1]
+public_username = sys.argv[2]
+
+def update_ledger():
+  '''
+  Increment (or set) our user's count in the ledger file and add it to the
+  staging area.
+  '''
+
+  lines = []
+  found = False
+  with open(LEDGER_PATH, 'r') as f:
+    for line in f:
+      # kill whitespace since we add it back later
+      line = line.strip()
+
+      # get the username for the line
+      parts = line.split(':')
+
+      # if there are two parts, it's a "username: count" line
+      if len(parts) == 2:
+        username = parts[0].strip()
+
+        if username == public_username:
+          count = int(parts[1])
+          count += 1
+
+          # modify the line to reflect our new count
+          line = public_username + ': ' + str(count)
+
+          # mark that we modified our count
+          found = True
+
+      # add the line to the result
+      lines.append(line)
+
+  # if our name wasn't in the ledger, add it with our initial count
+  if not found:
+    lines.append(public_username + ': 1')
+
+  # re-write the file with the modified data
+  with open(LEDGER_PATH, 'w') as f:
+    f.write('\n'.join(lines) + '\n')
+
+  # add the file to the staging area since we've modified it
+  git.add(LEDGER_PATH)
+
+def load_difficulty():
+  '''Read in and return the value stored in the difficulty file.'''
+  with open('difficulty.txt', 'r') as f:
+    return f.read().strip()
+
+def solve(q, difficulty, message_header, unique_prefix):
+  '''
+  Brute force SHA1 until we generate a commit that's lexicographically smaller
+  than the difficulty.
+  '''
+
+  # add our unique prefix to our message header, to ensure we're not doing
+  # identical work.
+  message_header += str(unique_prefix)
+  message_header_len = len(message_header)
+
+  # a random int value to start from
+  counter = int(random.getrandbits(32))
+
+  hash_counter = 0
+
+  print 'brute forcing (%s)...' % hex(counter)
+
+  # using a constant is faster, see: http://stackoverflow.com/a/2262162
+  while 1:
+    digest = hashlib.sha1()
+
+    hex_value = hex(counter)
+
+    # this adds the commit object header to the digest BEFORE the message
+    digest.update('commit ')
+    digest.update(str(message_header_len + len(hex_value)))
+    digest.update('\0')
+
+    # add the commit message content
+    digest.update(message_header)
+    digest.update(hex_value)
+
+    # get the hex SHA1 value of the commit message
+    sha1 = digest.hexdigest()
+
+    # see if it passes the difficulty check
+    if sha1 < difficulty:
+      print '\nMined a Gitcoin with commit: %s' % sha1
+
+      # build the actual commit message we'll pass to git
+      commit_message = message_header + hex(counter)
+
+      # send back our message that we're done once we find a good SHA1 hash!
+      q.put((commit_message, sha1))
+      break
+
+    # try a new number!
+    counter += 1
+
+def reset_repo():
+  '''Reset the git repo and pull in the latest ledger/commit data.'''
+
+  if os.path.basename(os.getcwd()) == REPO_PATH:
+    git.reset('origin/master', hard=True)
+    git.pull(rebase=True)
+  else:
+    print "Can't reset repository, no such directory: '%s'" % REPO_PATH
+
+def setup_repo():
+  '''Clone the supplied repo and change to its directory.'''
+
+  if os.path.exists(REPO_PATH):
+    print "Using existing repository at '%s'" % REPO_PATH
+  else:
+    print "Cloning repository to '%s'" % REPO_PATH
+    git.clone(git_repo_url, REPO_PATH)
+
+  # navigate into the repo directory so everything will use it as its base
+  os.chdir(REPO_PATH)
+
+def main():
+  '''Continuously attempt to solve for the current repo contents.'''
+
+  try:
+    setup_repo()
+
+    # constants are faster!
+    while 1:
+      reset_repo()
+      update_ledger()
+
+      # exits once a solution is found
+      q = mp.Queue()
+
+      # create a Git tree object reflecting our modified ledger file
+      tree = git('write-tree').strip()
+      parent = git('rev-parse', 'HEAD').strip()
+      timestamp = str(int(time.time()))
+
+      # this part remains constant for the entire run
+      message_header = ''.join([
+          'tree ', tree, '\n',
+          'parent ', parent, '\n',
+          'author a <a@b.io> ', timestamp, ' +0000', '\n',
+          'committer a <a@b.io> ', timestamp, ' +0000', '\n',
+          '\n',
+      ])
+
+      # get the difficulty from the repo
+      difficulty = load_difficulty()
+
+      procs = []
+      for proc_id in xrange(mp.cpu_count()):
+        args = (q, difficulty, message_header, proc_id)
+        p = mp.Process(target=solve, args=args)
+        p.daemon = True
+
+        procs.append(p)
+
+        p.start()
+
+      # wait for the first result to come in, then push it
+      commit_message, sha1 = q.get()
+
+      # write our new commit to the index
+      git('hash-object', t='commit', w=True, stdin=True, _in=commit_message)
+      git('reset', '--hard', sha1)
+
+      try:
+        print 'Attempting to push result...'
+        git.push('origin', 'master')
+        print 'Success :)'
+      except sh.ErrorReturnCode:
+        print 'We were beat to the punch! Starting over :('
+
+      # kill all the processes with fire
+      print 'Terminating processes...'
+      for p in procs:
+        p.terminate()
+
+      # reset the queue
+      print 'Resetting queue...'
+      q.close()
+      q = mp.Queue()
+
+  except KeyboardInterrupt:
+    print 'Exiting.'
+    return
+
+if __name__ == '__main__':
+  main()

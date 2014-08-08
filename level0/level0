@@ -1,0 +1,21 @@
+#!/usr/bin/env python
+
+import re
+import sys
+import pybloomfilter
+
+word_regex = re.compile('([^ \n]+)');
+
+# process file into a nice set so we can easily test for membership
+words = pybloomfilter.BloomFilter(250000, 0.000001, 'filter.bf')
+
+def replace_word(match):
+  word = match.group(1)
+
+  if word.lower() not in words:
+    return '<' + word + '>'
+
+  return word
+
+# reading data all at once is faster, go figure
+print word_regex.sub(replace_word, sys.stdin.read()),
